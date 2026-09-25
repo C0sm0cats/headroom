@@ -1,6 +1,7 @@
 """Analyze headroom proxy logs for performance insights.
 
-Parses PERF log lines from ~/.headroom/logs/proxy.log* and produces
+Parses PERF log lines from ~/.headroom/logs/proxy-*.log* (per-worker and
+per-port) and the legacy ~/.headroom/logs/proxy.log* fallback, and produces
 actionable reports on token savings, cache efficiency, and transform impact.
 
 Cost accounting is **cache-aware**: saved tokens that would have been served
@@ -25,6 +26,14 @@ log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
 DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
+
+# Runtime-log filenames that carry PERF records: the legacy shared
+# ``proxy.log``, per-port ``proxy-<port>.log``, and worker-specific
+# ``proxy-<port>-<pid>.log`` (port and PID are digits), each with optional
+# rotation suffix ``.1``..``.5``. A positive match (not a
+# ``proxy-stdio`` blacklist) so unrelated files like ``proxy-stdio-8787.log``
+# or a hypothetical ``proxy-errors.log`` are never ingested as PERF input.
+_PERF_LOG_FILE_RE = re.compile(r"proxy(?:-\d+){0,2}\.log(?:\.\d+)?$")
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -313,7 +322,13 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
         if report.newest_kept_ts is None or ts_str > report.newest_kept_ts:
             report.newest_kept_ts = ts_str
 
-    # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
+    # Collect log files across every proxy instance:
+    #   - per-worker runtime logs: proxy-<port>-<pid>.log, rotations
+    #   - standard per-port runtime logs: proxy-<port>.log, rotations
+    #   - legacy shared log (backward compat): proxy.log, proxy.log.1, ...
+    # Selected by a positive filename match (``_PERF_LOG_FILE_RE``), so the
+    # proxy-stdio-*.log captures (stdout/stderr, not PERF records) and any other
+    # ``proxy-<word>.log`` are never fed to the parser.
     #
     # A rotated file last written before the cutoff cannot contain a record
     # inside the window, so skip it without opening it. Without this the cost
@@ -328,7 +343,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     # are stat'd once and the value reused for the sort.
     cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
     dated_files: list[tuple[float, Path]] = []
-    for path in log_dir.glob("proxy.log*"):
+    candidates = [p for p in log_dir.glob("proxy*.log*") if _PERF_LOG_FILE_RE.fullmatch(p.name)]
+    for path in candidates:
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -338,7 +354,9 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.log_files_skipped += 1
             continue
         dated_files.append((mtime, path))
-    log_files = [path for _, path in sorted(dated_files, key=lambda pair: pair[0])]
+    # Secondary key on the path keeps ordering deterministic when two files
+    # share an mtime (glob order is not stable).
+    log_files = [path for _, path in sorted(dated_files, key=lambda pair: (pair[0], str(pair[1])))]
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -498,8 +516,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
-
-def _as_number(value: object, cast: type) -> "int | float":
+def _as_number(value: object, cast: type) -> int | float:
     """Coerce a self-reported savings figure, or 0 if it is not a number.
 
     `savings=` is base64 JSON written by whatever plugin recorded it, and
@@ -512,14 +529,14 @@ def _as_number(value: object, cast: type) -> "int | float":
     try:
         out = cast(value)  # type: ignore[call-arg]
     except (TypeError, ValueError, OverflowError):
-        return cast(0)  # type: ignore[call-arg]
+        return cast(0)  # type: ignore[call-arg,no-any-return]
     # Finiteness only, matching what the WRITE side enforces (see MAX_STAGE_MS in
     # savings_attribution): inf/nan survive a float() cast and render as "inf",
     # which is not a measurement. A merely large finite value is left alone --
     # capping it here would invent a limit the recording side does not have.
     if isinstance(out, float) and not math.isfinite(out):
-        return cast(0)  # type: ignore[call-arg]
-    return out
+        return cast(0)  # type: ignore[call-arg,no-any-return]
+    return out  # type: ignore[no-any-return]
 
 
 def format_report(report: PerfReport) -> str:
@@ -806,9 +823,7 @@ def format_report(report: PerfReport) -> str:
         for item in getattr(record, "savings_breakdown", ()) or ():
             source = str(item.get("source") or "other")
             realized = bool(item.get("realized", True))
-            row = by_source.setdefault(
-                (source, realized), {"events": 0, "tokens": 0, "usd": 0.0}
-            )
+            row = by_source.setdefault((source, realized), {"events": 0, "tokens": 0, "usd": 0.0})
             row["events"] += 1
             row["tokens"] += max(0, _as_number(item.get("tokens"), int))
             row["usd"] += _as_number(item.get("usd"), float)
