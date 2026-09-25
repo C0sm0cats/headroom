@@ -128,7 +128,7 @@ def _openai_rate_limit_key(headers: dict[str, str]) -> str:
     """Return the credential identity used by the OpenAI rate limiter.
 
     OpenAI-compatible gateways may authenticate with either a bearer token or
-    an ``api-key`` header. Keyed hashing of the complete value keeps common
+    an ``api-key`` header. Deriving an identity from the complete value keeps common
     prefixes distinct without retaining recoverable credential material in
     bucket keys. The secret is process-local, like the limiter state.
     Requests without either retain the existing shared fallback bucket.
@@ -141,9 +141,14 @@ def _openai_rate_limit_key(headers: dict[str, str]) -> str:
         kind, credential = "api-key", api_key
     else:
         return "default"
-    digest = hashlib.blake2b(
-        f"{kind}:{credential}".encode(), key=_OPENAI_RATE_KEY_SECRET, digest_size=32
-    ).hexdigest()
+    digest = hashlib.scrypt(
+        f"{kind}:{credential}".encode(),
+        salt=_OPENAI_RATE_KEY_SECRET,
+        n=1024,
+        r=1,
+        p=1,
+        dklen=32,
+    ).hex()
     return f"{kind}:{digest}"
 
 
