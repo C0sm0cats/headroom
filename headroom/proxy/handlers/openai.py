@@ -9,7 +9,6 @@ import asyncio
 import contextlib
 import copy
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -142,7 +141,9 @@ def _openai_rate_limit_key(headers: dict[str, str]) -> str:
         kind, credential = "api-key", api_key
     else:
         return "default"
-    digest = hmac.digest(_OPENAI_RATE_KEY_SECRET, f"{kind}:{credential}".encode(), "sha256").hex()
+    digest = hashlib.blake2b(
+        f"{kind}:{credential}".encode(), key=_OPENAI_RATE_KEY_SECRET, digest_size=32
+    ).hexdigest()
     return f"{kind}:{digest}"
 
 
