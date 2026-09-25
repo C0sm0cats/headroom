@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -141,14 +142,9 @@ def _openai_rate_limit_key(headers: dict[str, str]) -> str:
         kind, credential = "api-key", api_key
     else:
         return "default"
-    digest = hashlib.scrypt(
-        f"{kind}:{credential}".encode(),
-        salt=_OPENAI_RATE_KEY_SECRET,
-        n=1024,
-        r=1,
-        p=1,
-        dklen=32,
-    ).hex()
+    # API credentials are identifiers, not passwords to verify. A process-keyed
+    # HMAC keeps bucket keys opaque without a password KDF on the request path.
+    digest = hmac.digest(_OPENAI_RATE_KEY_SECRET, f"{kind}:{credential}".encode(), "sha256").hex()
     return f"{kind}:{digest}"
 
 
